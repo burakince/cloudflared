@@ -58,3 +58,4 @@ Cloudflare currently supports versions of `cloudflared` 2020.5.1 and later. Brea
 |---|---|
 | 2020.5.1 and later | Supported |
 | Versions prior to 2020.5.1 | No longer supported |
+

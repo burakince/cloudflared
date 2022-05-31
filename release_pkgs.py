@@ -8,12 +8,16 @@
        them to be in an uploadable state.
     2. Upload these packages to a storage in a format that apt and yum expect.
 """
-import subprocess
+from subprocess import Popen, PIPE
 import os
 import argparse
+import base64
+from pathlib import Path
 import logging
+import shutil
 from hashlib import sha256
 
+import gnupg
 import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
@@ -47,7 +51,7 @@ class PkgUploader:
             config=config,
         )
 
-        print(f"uploading asset: {filename} to {upload_file_path}...")
+        print(f"uploading asset: {filename} to {upload_file_path} in bucket{self.bucket_name}...")
         try:
             r2.upload_file(filename, self.bucket_name, upload_file_path)
         except ClientError as e:
@@ -77,7 +81,7 @@ class PkgCreator:
             components, 
             description,
             gpg_key_id ):
-        with open(file_path, "w") as distributions_file:
+        with open(file_path, "w+") as distributions_file:
             for release in releases:
                 distributions_file.write(f"Origin: {origin}\n")
                 distributions_file.write(f"Label: {label}\n")
@@ -99,14 +103,87 @@ class PkgCreator:
         dist: contains all the pkgs and signed releases that are necessary for an apt download.
     """
     def create_deb_pkgs(self, release, deb_file):
-        self._clean_build_resources()
-        subprocess.call(("reprepro", "includedeb", release, deb_file))
+        print(f"creating deb pkgs: {release} : {deb_file}")
+        p = Popen(["reprepro", "includedeb", release, deb_file], stdout=PIPE, stderr=PIPE)
+        out, err = p.communicate()
+        if p.returncode != 0:
+            print(f"create deb_pkgs result => {out}, {err}")
+            raise
+
+    def create_rpm_pkgs(self, artifacts_path, gpg_key_name):
+        self._setup_rpm_pkg_directories(artifacts_path, gpg_key_name)
+        p = Popen(["createrepo", "./rpm"], stdout=PIPE, stderr=PIPE)
+        out, err = p.communicate()
+        if p.returncode != 0:
+            print(f"create rpm_pkgs result => {out}, {err}")
+            raise
+
+        self._sign_repomd()
+
+    def _sign_rpms(self, file_path):
+        p = Popen(["rpm" , "--define", f"_gpg_name {gpg_key_name}", "--addsign", file_path], stdout=PIPE, stderr=PIPE)
+        out, err = p.communicate()
+        if p.returncode != 0:
+            print(f"rpm sign result result => {out}, {err}")
+            raise
+
+    def _sign_repomd(self):
+        p = Popen(["gpg", "--batch", "--detach-sign", "--armor", "./rpm/repodata/repomd.xml"], stdout=PIPE, stderr=PIPE) 
+        out, err = p.communicate()
+        if p.returncode != 0:
+            print(f"sign repomd result => {out}, {err}")
+            raise
+        
+    """
+        sets up and signs the RPM directories in the following format:
+        - rpm 
+           - aarch64
+           - x86_64
+           - 386
+
+        this assumes the assets are in the format <prefix>-<aarch64/x86_64/386>.rpm
+    """
+    def _setup_rpm_pkg_directories(self, artifacts_path, gpg_key_name, archs=["aarch64", "x86_64", "386"]):
+        for arch in archs:
+            for root, _ , files in os.walk(artifacts_path):
+                for file in files:
+                    if file.endswith(f"{arch}.rpm"):
+                        new_dir = f"./rpm/{arch}"
+                        os.makedirs(new_dir, exist_ok=True)
+                        old_path = os.path.join(root, file)
+                        new_path = os.path.join(new_dir, file)
+                        shutil.copyfile(old_path, new_path)
+                        self._sign_rpms(new_path)
+    
+    """
+        imports gpg keys into the system so reprepro and createrepo can use it to sign packages.
+        it returns the GPG ID after a successful import
+    """
+    def import_gpg_keys(self, private_key, public_key):
+        gpg = gnupg.GPG()
+        private_key = base64.b64decode(private_key)
+        gpg.import_keys(private_key)
+        public_key = base64.b64decode(public_key)
+        gpg.import_keys(public_key)
+        data = gpg.list_keys(secret=True)
+        return (data[0]["fingerprint"], data[0]["uids"][0])
 
     """
-        This is mostly useful to clear previously built db, dist and pool resources.
+        basically rpm --import <key_file>
+        This enables us to sign rpms.
     """
-    def _clean_build_resources(self):
-        subprocess.call(("reprepro", "clearvanished"))
+    def import_rpm_key(self, public_key):
+        file_name = "pb.key"
+        with open(file_name, "wb") as f:
+            public_key = base64.b64decode(public_key)
+            f.write(public_key)
+        
+        p = Popen(["rpm", "--import", file_name], stdout=PIPE, stderr=PIPE)
+        out, err = p.communicate()
+        if p.returncode != 0:
+            print(f"create rpm import result => {out}, {err}")
+            raise
+
 
 """
     Walks through a directory and uploads it's assets to R2.
@@ -138,11 +215,12 @@ def upload_from_directories(pkg_uploader, directory, release, binary):
     gpg_key_id: is an id indicating the key the package should be signed with. The public key of this id will be 
     uploaded to R2 so it can be presented to apt downloaders.
 
-    release_version: is the cloudflared release version.
+    release_version: is the cloudflared release version. Only provide this if you want a permanent backup.
 """
 def create_deb_packaging(pkg_creator, pkg_uploader, releases, gpg_key_id, binary_name, archs, package_component, release_version):
     # set configuration for package creation.
     print(f"initialising configuration for {binary_name} , {archs}")
+    Path("./conf").mkdir(parents=True, exist_ok=True)
     pkg_creator.create_distribution_conf(
     "./conf/distributions",
     binary_name,
@@ -163,9 +241,22 @@ def create_deb_packaging(pkg_creator, pkg_uploader, releases, gpg_key_id, binary
     upload_from_directories(pkg_uploader, "dists", None, binary_name)
     upload_from_directories(pkg_uploader, "pool", None, binary_name)
 
-    print(f"uploading versioned release {release_version} to r2...")
-    upload_from_directories(pkg_uploader, "dists", release_version, binary_name)
-    upload_from_directories(pkg_uploader, "pool", release_version, binary_name)
+    if release_version:
+        print(f"uploading versioned release {release_version} to r2...")
+        upload_from_directories(pkg_uploader, "dists", release_version, binary_name)
+        upload_from_directories(pkg_uploader, "pool", release_version, binary_name)
+
+def create_rpm_packaging(pkg_creator, pkg_uploader, artifacts_path, release_version, binary_name, gpg_key_name):
+    print(f"creating rpm pkgs...")
+    pkg_creator.create_rpm_pkgs(artifacts_path, gpg_key_name)
+
+    print("uploading latest to r2...")
+    upload_from_directories(pkg_uploader, "rpm", None, binary_name)
+
+    if release_version:
+        print(f"uploading versioned release {release_version} to r2...")
+        upload_from_directories(pkg_uploader, "rpm", release_version, binary_name)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -173,7 +264,7 @@ def parse_args():
     )
 
     parser.add_argument(
-            "--bucket", default=os.environ.get("R2_BUCKET_NAME"), help="R2 Bucket name"
+            "--bucket", default=os.environ.get("R2_BUCKET"), help="R2 Bucket name"
     )
     parser.add_argument(
             "--id", default=os.environ.get("R2_CLIENT_ID"), help="R2 Client ID"
@@ -186,7 +277,7 @@ def parse_args():
     )
     parser.add_argument(
             "--release-tag", default=os.environ.get("RELEASE_VERSION"), help="Release version you want your pkgs to be\
-            prefixed with"
+            prefixed with. Leave empty if you don't want tagged release versions backed up to R2."
     )
 
     parser.add_argument(
@@ -194,8 +285,13 @@ def parse_args():
     )
 
     parser.add_argument(
-            "--gpg-key-id", default=os.environ.get("GPG_KEY_ID"), help="gpg key ID that's being used to sign release\
-            packages."
+            "--gpg-private-key", default=os.environ.get("LINUX_SIGNING_PRIVATE_KEY"), help="GPG private key to sign the\
+            packages"
+    )
+
+    parser.add_argument(
+            "--gpg-public-key", default=os.environ.get("LINUX_SIGNING_PUBLIC_KEY"), help="GPG public key used for\
+            signing packages"
     )
 
     parser.add_argument(
@@ -220,6 +316,12 @@ if __name__ == "__main__":
         exit(1)
 
     pkg_creator = PkgCreator()
+    (gpg_key_id, gpg_key_name) = pkg_creator.import_gpg_keys(args.gpg_private_key, args.gpg_public_key)
+    pkg_creator.import_rpm_key(args.gpg_public_key)
+
     pkg_uploader = PkgUploader(args.account, args.bucket, args.id, args.secret)
-    create_deb_packaging(pkg_creator, pkg_uploader, args.deb_based_releases, args.gpg_key_id, args.binary, 
-            args.archs, "main", args.release_tag)
+    print(f"signing with gpg_key: {gpg_key_id}")
+    create_deb_packaging(pkg_creator, pkg_uploader, args.deb_based_releases, gpg_key_id, args.binary, args.archs,
+            "main", args.release_tag)
+    
+    create_rpm_packaging(pkg_creator, pkg_uploader, "./built_artifacts", args.release_tag, args.binary, gpg_key_name)

@@ -40,6 +40,10 @@ ifneq ($(GO_BUILD_TAGS),)
 	GO_BUILD_TAGS := -tags "$(GO_BUILD_TAGS)"
 endif
 
+ifeq ($(debug), 1)
+	GO_BUILD_TAGS += -gcflags="all=-N -l"
+endif
+
 IMPORT_PATH    := github.com/cloudflare/cloudflared
 PACKAGE_DIR    := $(CURDIR)/packaging
 PREFIX         := /usr
@@ -260,6 +264,10 @@ github-release: cloudflared
 .PHONY: github-release-built-pkgs
 github-release-built-pkgs:
 	python3 github_release.py --path $(PWD)/built_artifacts --release-version $(VERSION)
+
+.PHONY: release-pkgs-linux
+release-pkgs-linux:
+	python3 ./release_pkgs.py
 
 .PHONY: github-message
 github-message:

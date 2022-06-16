@@ -43,6 +43,7 @@ type TunnelConfig struct {
 	CloseConnOnce   *sync.Once // Used to close connectedSignal no more than once
 	EdgeAddrs       []string
 	Region          string
+	EdgeIPVersion   allregions.ConfigIPVersion
 	HAConnections   int
 	IncidentLookup  IncidentLookup
 	IsAutoupdated   bool
@@ -549,9 +550,9 @@ func ServeQUIC(
 	quicConfig := &quic.Config{
 		HandshakeIdleTimeout:  quicpogs.HandshakeIdleTimeout,
 		MaxIdleTimeout:        quicpogs.MaxIdleTimeout,
+		KeepAlivePeriod:       quicpogs.MaxIdlePingPeriod,
 		MaxIncomingStreams:    connection.MaxConcurrentStreams,
 		MaxIncomingUniStreams: connection.MaxConcurrentStreams,
-		KeepAlive:             true,
 		EnableDatagrams:       true,
 		MaxDatagramFrameSize:  quicpogs.MaxDatagramFrameSize,
 		Tracer:                quicpogs.NewClientTracer(connLogger.Logger(), connIndex),

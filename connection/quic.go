@@ -31,11 +31,13 @@ const (
 	HTTPMethodKey = "HttpMethod"
 	// HTTPHostKey is used to get or set http Method in QUIC ALPN if the underlying proxy connection type is HTTP.
 	HTTPHostKey = "HttpHost"
+
+	QUICMetadataFlowID = "FlowID"
 )
 
 // QUICConnection represents the type that facilitates Proxying via QUIC streams.
 type QUICConnection struct {
-	session              quic.Session
+	session              quic.Connection
 	logger               *zerolog.Logger
 	orchestrator         Orchestrator
 	sessionManager       datagramsession.Manager
@@ -120,6 +122,11 @@ func (q *QUICConnection) serveControlStream(ctx context.Context, controlStream q
 	return nil
 }
 
+// Close closes the session with no errors specified.
+func (q *QUICConnection) Close() {
+	q.session.CloseWithError(0, "")
+}
+
 func (q *QUICConnection) acceptStream(ctx context.Context) error {
 	defer q.Close()
 	for {
@@ -131,20 +138,17 @@ func (q *QUICConnection) acceptStream(ctx context.Context) error {
 			}
 			return fmt.Errorf("failed to accept QUIC stream: %w", err)
 		}
-		go func() {
-			stream := quicpogs.NewSafeStreamCloser(quicStream)
-			defer stream.Close()
-
-			if err = q.handleStream(stream); err != nil {
-				q.logger.Err(err).Msg("Failed to handle QUIC stream")
-			}
-		}()
+		go q.runStream(quicStream)
 	}
 }
 
-// Close closes the session with no errors specified.
-func (q *QUICConnection) Close() {
-	q.session.CloseWithError(0, "")
+func (q *QUICConnection) runStream(quicStream quic.Stream) {
+	stream := quicpogs.NewSafeStreamCloser(quicStream)
+	defer stream.Close()
+
+	if err := q.handleStream(stream); err != nil {
+		q.logger.Err(err).Msg("Failed to handle QUIC stream")
+	}
 }
 
 func (q *QUICConnection) handleStream(stream io.ReadWriteCloser) error {
@@ -180,6 +184,7 @@ func (q *QUICConnection) handleDataStream(stream *quicpogs.RequestServerStream) 
 	if err != nil {
 		return err
 	}
+
 	switch connectRequest.Type {
 	case quicpogs.ConnectionTypeHTTP, quicpogs.ConnectionTypeWebsocket:
 		tracedReq, err := buildHTTPRequest(connectRequest, stream)
@@ -191,7 +196,9 @@ func (q *QUICConnection) handleDataStream(stream *quicpogs.RequestServerStream) 
 		return originProxy.ProxyHTTP(w, tracedReq, connectRequest.Type == quicpogs.ConnectionTypeWebsocket)
 	case quicpogs.ConnectionTypeTCP:
 		rwa := &streamReadWriteAcker{stream}
-		return originProxy.ProxyTCP(context.Background(), rwa, &TCPRequest{Dest: connectRequest.Dest})
+		metadata := connectRequest.MetadataMap()
+		return originProxy.ProxyTCP(context.Background(), rwa, &TCPRequest{Dest: connectRequest.Dest,
+			FlowID: metadata[QUICMetadataFlowID]})
 	}
 	return nil
 }

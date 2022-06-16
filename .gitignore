@@ -13,6 +13,8 @@ cscope.*
 /cloudflared.1
 /packaging
 .DS_Store
+*.bak
+**/*.bak
 *-session.log
 ssh_server_tests/.env
 /.cover

@@ -143,15 +143,20 @@ func (q *QUICConnection) acceptStream(ctx context.Context) error {
 }
 
 func (q *QUICConnection) runStream(quicStream quic.Stream) {
+	ctx := quicStream.Context()
 	stream := quicpogs.NewSafeStreamCloser(quicStream)
 	defer stream.Close()
 
-	if err := q.handleStream(stream); err != nil {
+	// we are going to fuse readers/writers from stream <- cloudflared -> origin, and we want to guarantee that
+	// code executed in the code path of handleStream don't trigger an earlier close to the downstream stream.
+	// So, we wrap the stream with a no-op closer and only this method can actually close the stream.
+	noCloseStream := &nopCloserReadWriter{stream}
+	if err := q.handleStream(ctx, noCloseStream); err != nil {
 		q.logger.Err(err).Msg("Failed to handle QUIC stream")
 	}
 }
 
-func (q *QUICConnection) handleStream(stream io.ReadWriteCloser) error {
+func (q *QUICConnection) handleStream(ctx context.Context, stream io.ReadWriteCloser) error {
 	signature, err := quicpogs.DetermineProtocol(stream)
 	if err != nil {
 		return err
@@ -162,7 +167,7 @@ func (q *QUICConnection) handleStream(stream io.ReadWriteCloser) error {
 		if err != nil {
 			return err
 		}
-		return q.handleDataStream(reqServerStream)
+		return q.handleDataStream(ctx, reqServerStream)
 	case quicpogs.RPCStreamProtocolSignature:
 		rpcStream, err := quicpogs.NewRPCServerStream(stream, signature)
 		if err != nil {
@@ -174,13 +179,13 @@ func (q *QUICConnection) handleStream(stream io.ReadWriteCloser) error {
 	}
 }
 
-func (q *QUICConnection) handleDataStream(stream *quicpogs.RequestServerStream) error {
+func (q *QUICConnection) handleDataStream(ctx context.Context, stream *quicpogs.RequestServerStream) error {
 	request, err := stream.ReadConnectRequestData()
 	if err != nil {
 		return err
 	}
 
-	if err := q.dispatchRequest(stream, err, request); err != nil {
+	if err := q.dispatchRequest(ctx, stream, err, request); err != nil {
 		_ = stream.WriteConnectResponseData(err)
 		q.logger.Err(err).Str("type", request.Type.String()).Str("dest", request.Dest).Msg("Request failed")
 	}
@@ -188,7 +193,7 @@ func (q *QUICConnection) handleDataStream(stream *quicpogs.RequestServerStream) 
 	return nil
 }
 
-func (q *QUICConnection) dispatchRequest(stream *quicpogs.RequestServerStream, err error, request *quicpogs.ConnectRequest) error {
+func (q *QUICConnection) dispatchRequest(ctx context.Context, stream *quicpogs.RequestServerStream, err error, request *quicpogs.ConnectRequest) error {
 	originProxy, err := q.orchestrator.GetOriginProxy()
 	if err != nil {
 		return err
@@ -196,7 +201,7 @@ func (q *QUICConnection) dispatchRequest(stream *quicpogs.RequestServerStream, e
 
 	switch request.Type {
 	case quicpogs.ConnectionTypeHTTP, quicpogs.ConnectionTypeWebsocket:
-		tracedReq, err := buildHTTPRequest(request, stream)
+		tracedReq, err := buildHTTPRequest(ctx, request, stream, q.logger)
 		if err != nil {
 			return err
 		}
@@ -206,9 +211,10 @@ func (q *QUICConnection) dispatchRequest(stream *quicpogs.RequestServerStream, e
 	case quicpogs.ConnectionTypeTCP:
 		rwa := &streamReadWriteAcker{stream}
 		metadata := request.MetadataMap()
-		return originProxy.ProxyTCP(context.Background(), rwa, &TCPRequest{
-			Dest:   request.Dest,
-			FlowID: metadata[QUICMetadataFlowID],
+		return originProxy.ProxyTCP(ctx, rwa, &TCPRequest{
+			Dest:      request.Dest,
+			FlowID:    metadata[QUICMetadataFlowID],
+			CfTraceID: metadata[tracing.TracerContextName],
 		})
 	}
 	return nil
@@ -295,8 +301,12 @@ type streamReadWriteAcker struct {
 }
 
 // AckConnection acks response back to the proxy.
-func (s *streamReadWriteAcker) AckConnection() error {
-	return s.WriteConnectResponseData(nil)
+func (s *streamReadWriteAcker) AckConnection(tracePropagation string) error {
+	metadata := quicpogs.Metadata{
+		Key: tracing.CanonicalCloudflaredTracingHeader,
+		Val: tracePropagation,
+	}
+	return s.WriteConnectResponseData(nil, metadata)
 }
 
 // httpResponseAdapter translates responses written by the HTTP Proxy into ones that can be used in QUIC.
@@ -324,14 +334,19 @@ func (hrw httpResponseAdapter) WriteErrorResponse(err error) {
 	hrw.WriteConnectResponseData(err, quicpogs.Metadata{Key: "HttpStatus", Val: strconv.Itoa(http.StatusBadGateway)})
 }
 
-func buildHTTPRequest(connectRequest *quicpogs.ConnectRequest, body io.ReadCloser) (*tracing.TracedRequest, error) {
+func buildHTTPRequest(
+	ctx context.Context,
+	connectRequest *quicpogs.ConnectRequest,
+	body io.ReadCloser,
+	log *zerolog.Logger,
+) (*tracing.TracedHTTPRequest, error) {
 	metadata := connectRequest.MetadataMap()
 	dest := connectRequest.Dest
 	method := metadata[HTTPMethodKey]
 	host := metadata[HTTPHostKey]
 	isWebsocket := connectRequest.Type == quicpogs.ConnectionTypeWebsocket
 
-	req, err := http.NewRequest(method, dest, body)
+	req, err := http.NewRequestWithContext(ctx, method, dest, body)
 	if err != nil {
 		return nil, err
 	}
@@ -366,7 +381,7 @@ func buildHTTPRequest(connectRequest *quicpogs.ConnectRequest, body io.ReadClose
 	stripWebsocketUpgradeHeader(req)
 
 	// Check for tracing on request
-	tracedReq := tracing.NewTracedRequest(req)
+	tracedReq := tracing.NewTracedHTTPRequest(req, log)
 	return tracedReq, err
 }
 
@@ -383,4 +398,12 @@ func isTransferEncodingChunked(req *http.Request) bool {
 	// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Transfer-Encoding suggests that this can be a comma
 	// separated value as well.
 	return strings.Contains(strings.ToLower(transferEncodingVal), "chunked")
+}
+
+type nopCloserReadWriter struct {
+	io.ReadWriteCloser
+}
+
+func (n *nopCloserReadWriter) Close() error {
+	return nil
 }

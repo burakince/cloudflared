@@ -70,7 +70,7 @@ jobs:
         with:
           registry: docker.io
           username: ${{ github.actor }}
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # Login against a Docker registry except on PR
       # https://github.com/docker/login-action

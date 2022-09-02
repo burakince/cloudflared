@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/cloudflare/cloudflared/datagramsession"
 	"github.com/cloudflare/cloudflared/ingress"
+	"github.com/cloudflare/cloudflared/packet"
 	quicpogs "github.com/cloudflare/cloudflared/quic"
 	"github.com/cloudflare/cloudflared/tracing"
 	tunnelpogs "github.com/cloudflare/cloudflared/tunnelrpc/pogs"
@@ -45,7 +47,8 @@ type QUICConnection struct {
 	// sessionManager tracks active sessions. It receives datagrams from quic connection via datagramMuxer
 	sessionManager datagramsession.Manager
 	// datagramMuxer mux/demux datagrams from quic connection
-	datagramMuxer        *quicpogs.DatagramMuxer
+	datagramMuxer        quicpogs.BaseDatagramMuxer
+	packetRouter         *packetRouter
 	controlStreamHandler ControlStreamHandler
 	connOptions          *tunnelpogs.ConnectionOptions
 }
@@ -59,15 +62,29 @@ func NewQUICConnection(
 	connOptions *tunnelpogs.ConnectionOptions,
 	controlStreamHandler ControlStreamHandler,
 	logger *zerolog.Logger,
+	icmpProxy ingress.ICMPProxy,
 ) (*QUICConnection, error) {
 	session, err := quic.DialAddr(edgeAddr.String(), tlsConfig, quicConfig)
 	if err != nil {
 		return nil, &EdgeQuicDialError{Cause: err}
 	}
 
-	demuxChan := make(chan *quicpogs.SessionDatagram, demuxChanCapacity)
-	datagramMuxer := quicpogs.NewDatagramMuxer(session, logger, demuxChan)
-	sessionManager := datagramsession.NewManager(logger, datagramMuxer.MuxSession, demuxChan)
+	sessionDemuxChan := make(chan *packet.Session, demuxChanCapacity)
+	var (
+		datagramMuxer quicpogs.BaseDatagramMuxer
+		pr            *packetRouter
+	)
+	if icmpProxy != nil {
+		pr = &packetRouter{
+			muxer:     quicpogs.NewDatagramMuxerV2(session, logger, sessionDemuxChan),
+			icmpProxy: icmpProxy,
+			logger:    logger,
+		}
+		datagramMuxer = pr.muxer
+	} else {
+		datagramMuxer = quicpogs.NewDatagramMuxer(session, logger, sessionDemuxChan)
+	}
+	sessionManager := datagramsession.NewManager(logger, datagramMuxer.SendToSession, sessionDemuxChan)
 
 	return &QUICConnection{
 		session:              session,
@@ -75,6 +92,7 @@ func NewQUICConnection(
 		logger:               logger,
 		sessionManager:       sessionManager,
 		datagramMuxer:        datagramMuxer,
+		packetRouter:         pr,
 		controlStreamHandler: controlStreamHandler,
 		connOptions:          connOptions,
 	}, nil
@@ -115,6 +133,12 @@ func (q *QUICConnection) Serve(ctx context.Context) error {
 		defer cancel()
 		return q.datagramMuxer.ServeReceive(ctx)
 	})
+	if q.packetRouter != nil {
+		errGroup.Go(func() error {
+			defer cancel()
+			return q.packetRouter.serve(ctx)
+		})
+	}
 
 	return errGroup.Wait()
 }
@@ -156,9 +180,10 @@ func (q *QUICConnection) runStream(quicStream quic.Stream) {
 	defer stream.Close()
 
 	// we are going to fuse readers/writers from stream <- cloudflared -> origin, and we want to guarantee that
-	// code executed in the code path of handleStream don't trigger an earlier close to the downstream stream.
-	// So, we wrap the stream with a no-op closer and only this method can actually close the stream.
-	noCloseStream := &nopCloserReadWriter{stream}
+	// code executed in the code path of handleStream don't trigger an earlier close to the downstream write stream.
+	// So, we wrap the stream with a no-op write closer and only this method can actually close write side of the stream.
+	// A call to close will simulate a close to the read-side, which will fail subsequent reads.
+	noCloseStream := &nopCloserReadWriter{ReadWriteCloser: stream}
 	if err := q.handleStream(ctx, noCloseStream); err != nil {
 		q.logger.Err(err).Msg("Failed to handle QUIC stream")
 	}
@@ -302,6 +327,32 @@ func (q *QUICConnection) UpdateConfiguration(ctx context.Context, version int32,
 	return q.orchestrator.UpdateConfig(version, config)
 }
 
+type packetRouter struct {
+	muxer     *quicpogs.DatagramMuxerV2
+	icmpProxy ingress.ICMPProxy
+	logger    *zerolog.Logger
+}
+
+func (pr *packetRouter) serve(ctx context.Context) error {
+	icmpDecoder := packet.NewICMPDecoder()
+	for {
+		pk, err := pr.muxer.ReceivePacket(ctx)
+		if err != nil {
+			return err
+		}
+		icmpPacket, err := icmpDecoder.Decode(pk)
+		if err != nil {
+			pr.logger.Err(err).Msg("Failed to decode ICMP packet from quic datagram")
+			continue
+		}
+
+		if err := pr.icmpProxy.Request(icmpPacket, pr.muxer); err != nil {
+			pr.logger.Err(err).Str("src", icmpPacket.Src.String()).Str("dst", icmpPacket.Dst.String()).Msg("Failed to send ICMP packet")
+			continue
+		}
+	}
+}
+
 // streamReadWriteAcker is a light wrapper over QUIC streams with a callback to send response back to
 // the client.
 type streamReadWriteAcker struct {
@@ -324,6 +375,10 @@ type httpResponseAdapter struct {
 
 func newHTTPResponseAdapter(s *quicpogs.RequestServerStream) httpResponseAdapter {
 	return httpResponseAdapter{s}
+}
+
+func (hrw httpResponseAdapter) AddTrailer(trailerName, trailerValue string) {
+	// we do not support trailers over QUIC
 }
 
 func (hrw httpResponseAdapter) WriteRespHeaders(status int, header http.Header) error {
@@ -408,10 +463,39 @@ func isTransferEncodingChunked(req *http.Request) bool {
 	return strings.Contains(strings.ToLower(transferEncodingVal), "chunked")
 }
 
+// A helper struct that guarantees a call to close only affects read side, but not write side.
 type nopCloserReadWriter struct {
 	io.ReadWriteCloser
+
+	// for use by Read only
+	// we don't need a memory barrier here because there is an implicit assumption that
+	// Read calls can't happen concurrently by different go-routines.
+	sawEOF bool
+	// should be updated and read using atomic primitives.
+	// value is read in Read method and written in Close method, which could be done by different
+	// go-routines.
+	closed uint32
 }
 
-func (n *nopCloserReadWriter) Close() error {
+func (np *nopCloserReadWriter) Read(p []byte) (n int, err error) {
+	if np.sawEOF {
+		return 0, io.EOF
+	}
+
+	if atomic.LoadUint32(&np.closed) > 0 {
+		return 0, fmt.Errorf("closed by handler")
+	}
+
+	n, err = np.ReadWriteCloser.Read(p)
+	if err == io.EOF {
+		np.sawEOF = true
+	}
+
+	return
+}
+
+func (np *nopCloserReadWriter) Close() error {
+	atomic.StoreUint32(&np.closed, 1)
+
 	return nil
 }

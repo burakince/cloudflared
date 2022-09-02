@@ -1,7 +1,6 @@
 package quic
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
@@ -10,14 +9,20 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"net/netip"
 	"testing"
 	"time"
 
+	"github.com/google/gopacket/layers"
 	"github.com/google/uuid"
 	"github.com/lucas-clemente/quic-go"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/cloudflare/cloudflared/packet"
 )
 
 var (
@@ -57,7 +62,7 @@ func TestDatagram(t *testing.T) {
 	maxPayload := make([]byte, maxDatagramPayloadSize)
 	noPayloadSession := uuid.New()
 	maxPayloadSession := uuid.New()
-	sessionToPayload := []*SessionDatagram{
+	sessionToPayload := []*packet.Session{
 		{
 			ID:      noPayloadSession,
 			Payload: make([]byte, 0),
@@ -67,15 +72,45 @@ func TestDatagram(t *testing.T) {
 			Payload: maxPayload,
 		},
 	}
-	flowPayloads := [][]byte{
-		maxPayload,
+
+	packets := []packet.ICMP{
+		{
+			IP: &packet.IP{
+				Src:      netip.MustParseAddr("172.16.0.1"),
+				Dst:      netip.MustParseAddr("192.168.0.1"),
+				Protocol: layers.IPProtocolICMPv4,
+			},
+			Message: &icmp.Message{
+				Type: ipv4.ICMPTypeTimeExceeded,
+				Code: 0,
+				Body: &icmp.TimeExceeded{
+					Data: []byte("original packet"),
+				},
+			},
+		},
+		{
+			IP: &packet.IP{
+				Src:      netip.MustParseAddr("172.16.0.2"),
+				Dst:      netip.MustParseAddr("192.168.0.2"),
+				Protocol: layers.IPProtocolICMPv4,
+			},
+			Message: &icmp.Message{
+				Type: ipv4.ICMPTypeEcho,
+				Code: 0,
+				Body: &icmp.Echo{
+					ID:   6182,
+					Seq:  9151,
+					Data: []byte("Test ICMP echo"),
+				},
+			},
+		},
 	}
 
 	testDatagram(t, 1, sessionToPayload, nil)
-	testDatagram(t, 2, sessionToPayload, flowPayloads)
+	testDatagram(t, 2, sessionToPayload, packets)
 }
 
-func testDatagram(t *testing.T, version uint8, sessionToPayloads []*SessionDatagram, packetPayloads [][]byte) {
+func testDatagram(t *testing.T, version uint8, sessionToPayloads []*packet.Session, packets []packet.ICMP) {
 	quicConfig := &quic.Config{
 		KeepAlivePeriod:      5 * time.Millisecond,
 		EnableDatagrams:      true,
@@ -95,19 +130,27 @@ func testDatagram(t *testing.T, version uint8, sessionToPayloads []*SessionDatag
 			return err
 		}
 
-		sessionDemuxChan := make(chan *SessionDatagram, 16)
+		sessionDemuxChan := make(chan *packet.Session, 16)
 
 		switch version {
 		case 1:
 			muxer := NewDatagramMuxer(quicSession, &logger, sessionDemuxChan)
 			muxer.ServeReceive(ctx)
 		case 2:
-			packetDemuxChan := make(chan []byte, len(packetPayloads))
-			muxer := NewDatagramMuxerV2(quicSession, &logger, sessionDemuxChan, packetDemuxChan)
+			muxer := NewDatagramMuxerV2(quicSession, &logger, sessionDemuxChan)
 			muxer.ServeReceive(ctx)
 
-			for _, expectedPayload := range packetPayloads {
-				require.Equal(t, expectedPayload, <-packetDemuxChan)
+			icmpDecoder := packet.NewICMPDecoder()
+			for _, pk := range packets {
+				received, err := muxer.ReceivePacket(ctx)
+				require.NoError(t, err)
+
+				receivedICMP, err := icmpDecoder.Decode(received)
+				require.NoError(t, err)
+				require.Equal(t, pk.IP, receivedICMP.IP)
+				require.Equal(t, pk.Type, receivedICMP.Type)
+				require.Equal(t, pk.Code, receivedICMP.Code)
+				require.Equal(t, pk.Body, receivedICMP.Body)
 			}
 		default:
 			return fmt.Errorf("unknown datagram version %d", version)
@@ -140,22 +183,30 @@ func testDatagram(t *testing.T, version uint8, sessionToPayloads []*SessionDatag
 		case 1:
 			muxer = NewDatagramMuxer(quicSession, &logger, nil)
 		case 2:
-			muxerV2 := NewDatagramMuxerV2(quicSession, &logger, nil, nil)
-			for _, payload := range packetPayloads {
-				require.NoError(t, muxerV2.MuxPacket(payload))
+			muxerV2 := NewDatagramMuxerV2(quicSession, &logger, nil)
+			encoder := packet.NewEncoder()
+			for _, pk := range packets {
+				encodedPacket, err := encoder.Encode(&pk)
+				require.NoError(t, err)
+				require.NoError(t, muxerV2.SendPacket(encodedPacket))
 			}
 			// Payload larger than transport MTU, should not be sent
-			require.Error(t, muxerV2.MuxPacket(largePayload))
+			require.Error(t, muxerV2.SendPacket(packet.RawPacket{
+				Data: largePayload,
+			}))
 			muxer = muxerV2
 		default:
 			return fmt.Errorf("unknown datagram version %d", version)
 		}
 
-		for _, sessionDatagram := range sessionToPayloads {
-			require.NoError(t, muxer.MuxSession(sessionDatagram.ID, sessionDatagram.Payload))
+		for _, session := range sessionToPayloads {
+			require.NoError(t, muxer.SendToSession(session))
 		}
 		// Payload larger than transport MTU, should not be sent
-		require.Error(t, muxer.MuxSession(testSessionID, largePayload))
+		require.Error(t, muxer.SendToSession(&packet.Session{
+			ID:      testSessionID,
+			Payload: largePayload,
+		}))
 
 		// Wait for edge to finish receiving the messages
 		time.Sleep(time.Millisecond * 100)
@@ -197,36 +248,4 @@ func generateTLSConfig() *tls.Config {
 		Certificates: []tls.Certificate{tlsCert},
 		NextProtos:   []string{"argotunnel"},
 	}
-}
-
-type sessionMuxer interface {
-	SendToSession(sessionID uuid.UUID, payload []byte) error
-}
-
-type mockSessionReceiver struct {
-	expectedSessionToPayload map[uuid.UUID][]byte
-	receivedCount            int
-}
-
-func (msr *mockSessionReceiver) ReceiveDatagram(sessionID uuid.UUID, payload []byte) error {
-	expectedPayload := msr.expectedSessionToPayload[sessionID]
-	if !bytes.Equal(expectedPayload, payload) {
-		return fmt.Errorf("expect %v to have payload %s, got %s", sessionID, string(expectedPayload), string(payload))
-	}
-	msr.receivedCount++
-	return nil
-}
-
-type mockFlowReceiver struct {
-	expectedPayloads [][]byte
-	receivedCount    int
-}
-
-func (mfr *mockFlowReceiver) ReceiveFlow(payload []byte) error {
-	expectedPayload := mfr.expectedPayloads[mfr.receivedCount]
-	if !bytes.Equal(expectedPayload, payload) {
-		return fmt.Errorf("expect flow %d to have payload %s, got %s", mfr.receivedCount, string(expectedPayload), string(payload))
-	}
-	mfr.receivedCount++
-	return nil
 }
